@@ -1,14 +1,25 @@
 fn main() {
-    let mut driver = DriverA::new();
-    let mut stack = TcpClientStack::new(&mut driver);
-    let mut socket0 = stack.socket().unwrap();
-    let mut socket1 = stack.socket().unwrap();
-    let mut socket2 = stack.socket().unwrap();
-    let _ = socket0.connect(SocketAddr);
-    let _ = socket1.connect(SocketAddr);
-    let _ = socket2.connect(SocketAddr);
-    drop(socket0);
-    let _socket0_again = stack.socket();
+    {
+        // &RefCell impls mutex_trait::Mutex
+        println!("Testing DriverA with &RefCell");
+        let driver = core::cell::RefCell::new(DriverA::new());
+        let mut stack = TcpClientStack::new(&driver);
+        // TODO I do not like that the user could do nasty things like:
+        // let borrow = driver.borrow_mut();
+        // stack.socket(); // panic: 'already borrowed: BorrowMutError'
+        let mut socket0 = stack.socket().unwrap();
+        let mut socket1 = stack.socket().unwrap();
+        let _ = socket0.connect(SocketAddr);
+        let _ = socket1.connect(SocketAddr);
+        drop(socket0);
+        let _socket0_again = stack.socket();
+    }
+
+    // Using another Mutex impl
+    println!("\nTesting DriverB with StdMutex (i.e. std::sync::Mutex)");
+    let driver = StdMutex(std::sync::Mutex::new(DriverB::new()));
+    let mut stack = TcpClientStack::new(&driver);
+    let _ = stack.socket().unwrap().connect(SocketAddr);
 }
 
 //
@@ -28,67 +39,60 @@ pub trait NalDriver {
 //
 
 #[derive(Clone, Copy)]
-pub struct TcpClientStack<'a, D>
+pub struct TcpClientStack<D, M>
 where
-D: NalDriver
+    D: NalDriver,
+    M: mutex_trait::Mutex<Data = D> + Clone,
 {
-    driver: &'a core::cell::RefCell<D>,
+    driver: M,
 }
 
-impl<'a, D> TcpClientStack<'a, D>
+impl<D, M> TcpClientStack<D, M>
 where
-D: NalDriver
+    D: NalDriver,
+    M: mutex_trait::Mutex<Data = D> + Clone,
 {
-    /// Although we only store the Bg77Driver as a `&RefCell` we require a `&mut RefCell`. Like
-    /// this, we can be sure that there are no other `&RefCell`s to the driver, only the ones we
-    /// control ourselves. This ensures that `driver.borrow_mut()` will never panic because:
-    /// 1. Our own `borrow_mut()` calls will never outlive the method calls.
-    /// 2. The network stack and the sockets can not be transferred to other threads/contexts (i.e.
-    /// they are `!Send + !Sync`).
-    pub fn new(
-        driver: &'a mut core::cell::RefCell<D>,
-    ) -> Self {
+    pub fn new(driver: M) -> Self {
         TcpClientStack { driver }
     }
 
-    fn socket(&mut self) -> Result<TcpSocketHandle<'a, D>, Error> {
+    fn socket(&mut self) -> Result<TcpSocketHandle<D, M>, Error> {
         Ok(TcpSocketHandle {
-            socket: self.driver.borrow_mut().socket()?,
-            driver: self.driver,
+            socket: self.driver.lock(|d| d.socket())?,
+            driver: self.driver.clone(),
         })
     }
 }
 
 /// Socket handle type for a TCP socket
-pub struct TcpSocketHandle<'a, D>
+pub struct TcpSocketHandle<D, M>
 where
-D: NalDriver
+    D: NalDriver,
+    M: mutex_trait::Mutex<Data = D> + Clone,
 {
     socket: D::SocketIdentifier,
-    driver: &'a core::cell::RefCell<D>,
+    driver: M,
 }
 
-impl <'a, D> TcpSocketHandle<'a, D> 
+impl<D, M> TcpSocketHandle<D, M>
 where
-D: NalDriver
+    D: NalDriver,
+    M: mutex_trait::Mutex<Data = D> + Clone,
 {
-    fn connect(
-        &mut self,
-        remote: SocketAddr,
-    ) -> Result<(), Error> {
-        let mut driver = self.driver.borrow_mut();
-        driver.connect(self.socket, remote)
+    fn connect(&mut self, remote: SocketAddr) -> Result<(), Error> {
+        self.driver.lock(|d| d.connect(self.socket, remote))
     }
 
     // + send, receive
 }
 
-impl<D> Drop for TcpSocketHandle<'_, D>
+impl<D, M> Drop for TcpSocketHandle<D, M>
 where
-D: NalDriver
+    D: NalDriver,
+    M: mutex_trait::Mutex<Data = D> + Clone,
 {
     fn drop(&mut self) {
-        self.driver.borrow_mut().close(self.socket)
+        self.driver.lock(|d| d.close(self.socket))
     }
 }
 
@@ -97,19 +101,17 @@ D: NalDriver
 //
 
 /// A Network Driver that supports multiple sockets
-pub struct DriverA
-{
+pub struct DriverA {
     sockets: [SocketA; 12],
 }
 
-impl DriverA
-{
-    pub fn new(
-    ) -> core::cell::RefCell<Self> {
-        let driver = DriverA {
-            sockets: [SocketA { state: SocketAState::Available }; 12],
-        };
-        core::cell::RefCell::new(driver)
+impl DriverA {
+    pub fn new() -> Self {
+        DriverA {
+            sockets: [SocketA {
+                state: SocketAState::Available,
+            }; 12],
+        }
     }
 }
 
@@ -127,13 +129,9 @@ impl NalDriver for DriverA {
         Err(Error)
     }
 
-    fn connect(
-        &mut self,
-        socket_index: usize,
-        _remote: SocketAddr,
-    ) -> Result<(), Error> {
+    fn connect(&mut self, socket_index: usize, _remote: SocketAddr) -> Result<(), Error> {
         // ...
-        println!("Connecting/Using socket {}", socket_index);
+        println!("Connecting socket {}", socket_index);
         Ok(())
     }
 
@@ -164,19 +162,15 @@ enum SocketAState {
 //
 
 /// A Network Driver that supports a single socket
-pub struct DriverB
-{
+pub struct DriverB {
     socket_available: bool,
 }
 
-impl DriverB
-{
-    pub fn new(
-    ) -> core::cell::RefCell<Self> {
-        let driver = DriverB {
+impl DriverB {
+    pub fn new() -> Self {
+        DriverB {
             socket_available: true,
-        };
-        core::cell::RefCell::new(driver)
+        }
     }
 }
 
@@ -185,6 +179,7 @@ impl NalDriver for DriverB {
 
     fn socket(&mut self) -> Result<(), Error> {
         if self.socket_available {
+            println!("Using single socket");
             self.socket_available = false;
             Ok(())
         } else {
@@ -192,19 +187,15 @@ impl NalDriver for DriverB {
         }
     }
 
-    fn connect(
-        &mut self,
-        _socket: (),
-        _remote: SocketAddr,
-    ) -> Result<(), Error> {
+    fn connect(&mut self, _socket: (), _remote: SocketAddr) -> Result<(), Error> {
         // ...
-        println!("Connecting/Using single socket");
+        println!("Connecting single socket");
         Ok(())
     }
 
     fn close(&mut self, _socket: ()) {
         // ...
-        println!("Closing socket");
+        println!("Closing single socket");
         self.socket_available = true;
     }
 
@@ -218,3 +209,14 @@ impl NalDriver for DriverB {
 pub struct SocketAddr;
 #[derive(Debug)]
 pub struct Error;
+
+pub struct StdMutex<D>(std::sync::Mutex<D>);
+
+impl<D> mutex_trait::Mutex for &'_ StdMutex<D> {
+    type Data = D;
+
+    fn lock<R>(&mut self, f: impl FnOnce(&mut Self::Data) -> R) -> R {
+        let mut d = self.0.lock().unwrap();
+        f(&mut d)
+    }
+}
